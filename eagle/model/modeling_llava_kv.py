@@ -17,10 +17,10 @@ from transformers.utils import (
 )
 from transformers.models.auto import AutoModel, AutoModelForCausalLM
 # from transformers.models.llava.configuration_llava import LlavaConfig
-from model.swift.configuration_llava import LlavaConfig
-from model.swift.modeling_llama import LlamaForCausalLM
+from transformers.models.llava.configuration_llava import LlavaConfig
+from model.modeling_llama_kv import LlamaForCausalLM
 
-from customlogger import log_metrics
+# from customlogger import log_metrics
 
 
 logger = logging.get_logger(__name__)
