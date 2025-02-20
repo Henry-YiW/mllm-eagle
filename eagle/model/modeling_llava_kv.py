@@ -298,26 +298,197 @@ LLAVA_INPUTS_DOCSTRING = r"""
     """The LLAVA model which consists of a vision backbone and a language model.""",
     LLAVA_START_DOCSTRING,
 )
-class LlavaForConditionalGeneration(LlavaPreTrainedModel, GenerationMixin):
+
+class LlavaModel(LlavaPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
-    def __init__(self, config: LlavaConfig):
+    def __init__(self, config: LlavaConfig, language_model: LlamaForCausalLM):
         super().__init__(config)
         # print('LlavaForConditionalGeneration Config: ', vars(config))
         self.vision_tower = AutoModel.from_config(config.vision_config)
 
         self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.vocab_size = config.text_config.vocab_size
+        # self.vocab_size = config.text_config.vocab_size
 
         # print('LlamaForCausalLM 2: ')
-        self.language_model = LlamaForCausalLM(config.text_config)
+        self.model = language_model.model
         
         # print('LlamaForCausalLM 3: ')
+        if language_model._tied_weights_keys is not None:
+            self._tied_weights_keys = [f"language_model.{k}" for k in self.language_model._tied_weights_keys]
+
+        self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
+
+        self.post_init()
+
+    @add_start_docstrings_to_model_forward(LLAVA_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=LlavaCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        pixel_values: torch.FloatTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        vision_feature_layer: Optional[int] = None,
+        vision_feature_select_strategy: Optional[str] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        num_logits_to_keep: int = 0,
+        draft_attn_skip_mask: torch.Tensor = None,
+        draft_mlp_skip_mask: torch.Tensor = None,
+        return_raw: bool = False,
+    ) -> Union[Tuple, LlavaCausalLMOutputWithPast]:
+        r"""
+        Args:
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
+            num_logits_to_keep (`int`, *optional*):
+                Calculate logits for the last `num_logits_to_keep` tokens. If `0`, calculate logits for all
+                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
+                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
+
+
+        Returns:
+
+        Example:
+
+        ```python
+        >>> from PIL import Image
+        >>> import requests
+        >>> from transformers import AutoProcessor, LlavaForConditionalGeneration
+
+        >>> model = LlavaForConditionalGeneration.from_pretrained("llava-hf/llava-1.5-7b-hf")
+        >>> processor = AutoProcessor.from_pretrained("llava-hf/llava-1.5-7b-hf")
+
+        >>> prompt = "USER: <image>\nWhat's the content of the image? ASSISTANT:"
+        >>> url = "https://www.ilankelman.org/stopsigns/australia.jpg"
+        >>> image = Image.open(requests.get(url, stream=True).raw)
+
+        >>> inputs = processor(images=image, text=prompt, return_tensors="pt")
+
+        >>> # Generate
+        >>> generate_ids = model.generate(**inputs, max_new_tokens=15)
+        >>> processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        "USER:  \nWhat's the content of the image? ASSISTANT: The image features a busy city street with a stop sign prominently displayed"
+        ```"""
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        
+        vision_feature_layer = (
+            vision_feature_layer if vision_feature_layer is not None else self.config.vision_feature_layer
+        )
+        vision_feature_select_strategy = (
+            vision_feature_select_strategy
+            if vision_feature_select_strategy is not None
+            else self.config.vision_feature_select_strategy
+        )
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if pixel_values is not None and inputs_embeds is not None:
+            raise ValueError(
+                "You cannot specify both pixel_values and inputs_embeds at the same time, and must specify either one"
+            )
+
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        if pixel_values is not None:
+            image_features = self.get_image_features(
+                pixel_values=pixel_values,
+                vision_feature_layer=vision_feature_layer,
+                vision_feature_select_strategy=vision_feature_select_strategy,
+            )
+
+            n_image_tokens = (input_ids == self.config.image_token_index).sum().item()
+            n_image_features = image_features.shape[0] * image_features.shape[1]
+            # print('input_ids', input_ids)
+            # print('n_image_tokens', n_image_tokens)
+            # print('n_image_features', n_image_features)
+            # if n_image_tokens != n_image_features:
+            #     raise ValueError(
+            #         f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+            #     )
+            special_image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
+            special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
+            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+
+        # log_metrics({
+        #     "attention_mask": attention_mask,
+        #     "position_ids": position_ids,
+        #     #"past_key_values": past_key_values,
+        #     "inputs_embeds": inputs_embeds,
+        #     "use_cache": use_cache,
+        #     "output_attentions": output_attentions,
+        #     "output_hidden_states": output_hidden_states,
+        #     "return_dict": return_dict,
+        #     # cache_position=cache_position,
+        #     # num_logits_to_keep=num_logits_to_keep,
+        #     "draft_attn_skip_mask": draft_attn_skip_mask,
+        #     "draft_mlp_skip_mask": draft_mlp_skip_mask,
+        # }, "swift_version_1_llava_forwarding.pkl")
+        outputs = self.model(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=True,
+            return_dict=return_dict,
+            # cache_position=cache_position,
+            # num_logits_to_keep=num_logits_to_keep,
+
+            draft_attn_skip_mask=draft_attn_skip_mask,
+            draft_mlp_skip_mask=draft_mlp_skip_mask,
+        )
+        
+        if not return_dict:
+            return outputs + (image_features if pixel_values is not None else None,)
+        # print('Finished LlavaCausalLMOutputWithPast')
+        return LlavaCausalLMOutputWithPast(
+            last_hidden_state=outputs.hidden_states[-1],
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            image_hidden_states=image_features if pixel_values is not None else None,
+        )
+        
+
+
+class LlavaForConditionalGeneration(LlavaPreTrainedModel, GenerationMixin):
+    _tied_weights_keys = ["lm_head.weight"]
+    def __init__(self, config: LlavaConfig):
+        super().__init__(config)
+        
+        print('Self Device', self.device)
+
+        self.language_model = LlamaForCausalLM(config.text_config)
         if self.language_model._tied_weights_keys is not None:
             self._tied_weights_keys = [f"language_model.{k}" for k in self.language_model._tied_weights_keys]
 
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
 
-        # print('LlamaForCausalLM 4: ')
+        self.model = LlavaModel(config, self.language_model)
+
+        self.pretraining_tp = self.language_model.config.pretraining_tp
+        self.vocab_size = self.language_model.config.vocab_size
+        self.lm_head = self.language_model.lm_head.to(self.device)
+
         self.post_init()
 
     def get_input_embeddings(self):
@@ -384,22 +555,13 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel, GenerationMixin):
         # global enabled_bitfit
         # enabled_bitfit = enabled
 
+    # def init_language_model(self):
+    #     self.model = self.language_model.model
 
-    def set_language_model(self, language_model):
-        self.language_model = language_model
-        self.model = language_model.model
-
-        self.pretraining_tp = language_model.config.pretraining_tp
-        self.vocab_size = language_model.config.vocab_size
-        self.lm_head = nn.Linear(language_model.config.hidden_size, language_model.config.vocab_size, bias=False)
-
-    def init_language_model(self):
-        self.model = self.language_model.model
-
-        self.pretraining_tp = self.language_model.config.pretraining_tp
-        self.vocab_size = self.language_model.config.vocab_size
-        print('Self Device', self.device)
-        self.lm_head = self.language_model.lm_head.to(self.device)
+    #     self.pretraining_tp = self.language_model.config.pretraining_tp
+    #     self.vocab_size = self.language_model.config.vocab_size
+    #     print('Self Device', self.device)
+    #     self.lm_head = self.language_model.lm_head.to(self.device)
 
     def get_image_features(
         self, pixel_values: torch.FloatTensor, vision_feature_layer: int, vision_feature_select_strategy: str
@@ -573,68 +735,22 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel, GenerationMixin):
         "USER:  \nWhat's the content of the image? ASSISTANT: The image features a busy city street with a stop sign prominently displayed"
         ```"""
 
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
         
-        vision_feature_layer = (
-            vision_feature_layer if vision_feature_layer is not None else self.config.vision_feature_layer
-        )
-        vision_feature_select_strategy = (
-            vision_feature_select_strategy
-            if vision_feature_select_strategy is not None
-            else self.config.vision_feature_select_strategy
-        )
-
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        if pixel_values is not None and inputs_embeds is not None:
-            raise ValueError(
-                "You cannot specify both pixel_values and inputs_embeds at the same time, and must specify either one"
-            )
-
-        if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings()(input_ids)
-
-        if pixel_values is not None:
-            image_features = self.get_image_features(
-                pixel_values=pixel_values,
-                vision_feature_layer=vision_feature_layer,
-                vision_feature_select_strategy=vision_feature_select_strategy,
-            )
-
-            n_image_tokens = (input_ids == self.config.image_token_index).sum().item()
-            n_image_features = image_features.shape[0] * image_features.shape[1]
-            # print('input_ids', input_ids)
-            # print('n_image_tokens', n_image_tokens)
-            # print('n_image_features', n_image_features)
-            # if n_image_tokens != n_image_features:
-            #     raise ValueError(
-            #         f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-            #     )
-            special_image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
-            special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
-            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
-
-        # log_metrics({
-        #     "attention_mask": attention_mask,
-        #     "position_ids": position_ids,
-        #     #"past_key_values": past_key_values,
-        #     "inputs_embeds": inputs_embeds,
-        #     "use_cache": use_cache,
-        #     "output_attentions": output_attentions,
-        #     "output_hidden_states": output_hidden_states,
-        #     "return_dict": return_dict,
-        #     # cache_position=cache_position,
-        #     # num_logits_to_keep=num_logits_to_keep,
-        #     "draft_attn_skip_mask": draft_attn_skip_mask,
-        #     "draft_mlp_skip_mask": draft_mlp_skip_mask,
-        # }, "swift_version_1_llava_forwarding.pkl")
-        outputs = self.language_model(
+        outputs = self.model(
+            input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -643,8 +759,10 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=True,
             return_dict=return_dict,
-            # cache_position=cache_position,
-            # num_logits_to_keep=num_logits_to_keep,
+            vision_feature_layer=vision_feature_layer,
+            vision_feature_select_strategy=vision_feature_select_strategy,
+            cache_position=cache_position,
+            num_logits_to_keep=num_logits_to_keep,
 
             draft_attn_skip_mask=draft_attn_skip_mask,
             draft_mlp_skip_mask=draft_mlp_skip_mask,
@@ -654,57 +772,21 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel, GenerationMixin):
 
         if return_raw:
             return outputs
-        # logits = outputs[0]
-
-        # outputs = self.model(
-        #     input_ids=input_ids,
-        #     attention_mask=attention_mask,
-        #     position_ids=position_ids,
-        #     past_key_values=past_key_values,
-        #     inputs_embeds=inputs_embeds,
-        #     use_cache=use_cache,
-        #     output_attentions=output_attentions,
-        #     output_hidden_states=output_hidden_states,
-        #     return_dict=return_dict,
-        #     draft_attn_skip_mask=draft_attn_skip_mask,
-        #     draft_mlp_skip_mask=draft_mlp_skip_mask,
-        # )
-        # hidden_states = outputs[0]
-        # print('hidden_states', hidden_states.shape)
-        # print("tensor device", hidden_states.device)
-        # if self.language_model.config.pretraining_tp > 1:
-        #     lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.language_model.config.pretraining_tp, dim=0)
-        #     logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.language_model.config.pretraining_tp)]
-        #     logits = torch.cat(logits, dim=-1)
-        # else:
-        #     # print("tensor dtype", hidden_states.dtype)
-        #     # print("lm head dtype", self.lm_head.weight.dtype)
-        #     # print("lm head", self.lm_head)
-        #     with torch.amp.autocast('cuda'):
-        #         logits = self.lm_head(hidden_states)
-        # # print('Finished logits')
-        # logits = logits.float()
-       # If return_dict=True
-        # Get the tuple of hidden states
-            
-        # Get the tuple of hidden states
-        # print("len(outputs)",len(outputs))
-        # hidden_states = outputs[2]
-
-        # # The hidden states tuple contains:
-        # embedding_output = hidden_states[0]    # Initial embedding layer output
-        # layer_outputs = hidden_states[1:-1]    # Hidden states from intermediate layers
-        # final_output = hidden_states[-1]       # Final layer output
-
-        # # Print shapes to understand the structure
-        # print("Number of hidden state tensors:", len(hidden_states))
-        # print("Embedding output shape:", embedding_output.shape)  # (batch_size, sequence_length, hidden_size)
-        # print("Example intermediate layer shape:", layer_outputs[0].shape)  # (batch_size, sequence_length, hidden_size)
-        # print("Final layer output shape:", final_output.shape)  # (batch_size, sequence_length, hidden_size)
         
-        logits = outputs[0]
-        #print("logits shape in llavaModel", logits.shape)
-
+        hidden_states = outputs[0]
+        if self.pretraining_tp > 1:
+            lm_head_slices = self.lm_head.weight.split(
+                self.vocab_size // self.pretraining_tp, dim=0
+            )
+            logits = [
+                F.linear(hidden_states, lm_head_slices[i])
+                for i in range(self.pretraining_tp)
+            ]
+            logits = torch.cat(logits, dim=-1)
+        else:
+            logits = self.lm_head(hidden_states)
+        logits = logits.float()
+        
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
@@ -734,7 +816,7 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel, GenerationMixin):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            image_hidden_states=image_features if pixel_values is not None else None,
+            image_hidden_states=outputs.image_features if pixel_values is not None else None,
         )
 
     def prepare_inputs_for_generation(

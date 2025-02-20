@@ -10,6 +10,7 @@ import os
 from transformers import PreTrainedModel, PretrainedConfig,AutoConfig
 
 
+from .modeling_llava_kv import LlavaForConditionalGeneration as KVLlavaForCausalLM
 from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
 from .modeling_mixtral_kv import MixtralForCausalLM as KVMixtralForCausalLM
 from .modeling_qwen2_kv import LlamaForCausalLM as KVQwen2ForCausalLM
@@ -99,6 +100,10 @@ class EaModel(nn.Module):
             base_model=KVQwen2ForCausalLM.from_pretrained(
                 base_model_path, **kwargs
             )
+        elif Type=='LlavaForConditionalGeneration':
+            base_model=KVLlavaForCausalLM.from_pretrained(
+                base_model_path, **kwargs
+            )
         else:
             base_model = KVMixtralForCausalLM.from_pretrained(
                 base_model_path, **kwargs
@@ -167,6 +172,7 @@ class EaModel(nn.Module):
             past_key_values=None,
             output_orig=False,
             position_ids=None,
+            pixel_values=None,
     ):
 
         with torch.inference_mode():
@@ -177,6 +183,14 @@ class EaModel(nn.Module):
                 past_key_values=past_key_values,
                 position_ids=position_ids,
             )
+            if pixel_values is not None:
+                outputs = self.base_model.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    position_ids=position_ids,
+                    pixel_values=pixel_values,
+                )
             if output_orig:
                 orig = self.base_model.lm_head(outputs[0])
             hidden_states = outputs[0]
